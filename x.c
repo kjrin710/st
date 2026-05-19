@@ -256,6 +256,61 @@ static char *opt_title = NULL;
 
 static uint buttons; /* bit field of pressed buttons */
 
+/* autoscroll: edge-triggered scrolling during mouse selection */
+#define AUTOSCROLL_THRESHOLD 3
+#define AUTOSCROLL_BASE      10.0  /* rows/sec at threshold */
+static int autoscroll_active;
+static int autoscroll_interval;
+static struct timespec autoscroll_next;
+
+static int
+autoscroll_tick(void)
+{
+	Window root, child;
+	int root_x, root_y, win_x, win_y;
+	unsigned int mask;
+	int col, row, ncol, nrow, dist, exponent;
+	double speed;
+	Arg a = {.i = 1};
+
+	if (!autoscroll_active)
+		return 0;
+
+	XQueryPointer(xw.dpy, xw.win, &root, &child,
+	              &root_x, &root_y, &win_x, &win_y, &mask);
+
+	col = (win_x - win.hborderpx) / win.cw;
+	row = (win_y - win.vborderpx) / win.ch;
+	ncol = win.tw / win.cw;
+	nrow = win.th / win.ch;
+	LIMIT(col, 0, ncol - 1);
+	LIMIT(row, 0, nrow - 1);
+
+	dist = row;  /* distance from top */
+	if (row > nrow / 2)
+		dist = nrow - 1 - row;  /* distance from bottom */
+
+	if (dist >= AUTOSCROLL_THRESHOLD) {
+		autoscroll_active = 0;
+		return 0;
+	}
+
+	exponent = AUTOSCROLL_THRESHOLD - dist;
+	speed = AUTOSCROLL_BASE * (1 << exponent);
+	autoscroll_interval = (int)(1000.0 / speed + 0.5);
+
+	/* scroll */
+	if (row < AUTOSCROLL_THRESHOLD)
+		kscrollup(&a);
+	else
+		kscrolldown(&a);
+
+	/* extend selection to current mouse position */
+	selextend(col, row, SEL_REGULAR, 0);
+
+	return 1;
+}
+
 void
 clipcopy(const Arg *dummy)
 {
@@ -721,6 +776,9 @@ brelease(XEvent *e)
 	if (1 <= btn && btn <= 11)
 		buttons &= ~(1 << (btn-1));
 
+	if (btn == Button1)
+		autoscroll_active = 0;
+
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
 		return;
@@ -735,12 +793,31 @@ brelease(XEvent *e)
 void
 bmotion(XEvent *e)
 {
+	int row, dist, nrow;
+
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
 		return;
 	}
 
 	mousesel(e, 0);
+
+	/* edge-triggered autoscroll during selection */
+	if (!(buttons & (1 << (Button1 - 1)))) {
+		autoscroll_active = 0;
+		return;
+	}
+
+	nrow = win.th / win.ch;
+	row = evrow(e);
+	dist = row;
+	if (row > nrow / 2)
+		dist = nrow - 1 - row;
+
+	if (dist < AUTOSCROLL_THRESHOLD)
+		autoscroll_active = 1;
+	else
+		autoscroll_active = 0;
 }
 
 void
@@ -2024,6 +2101,19 @@ run(void)
 				(handler[ev.type])(&ev);
 		}
 
+		/* autoscroll: edge-triggered scrolling during selection */
+		if (autoscroll_active && TIMEDIFF(autoscroll_next, now) <= 0) {
+			if (autoscroll_tick()) {
+				autoscroll_next = now;
+				autoscroll_next.tv_nsec +=
+					autoscroll_interval * 1000000L;
+				while (autoscroll_next.tv_nsec >= 1000000000L) {
+					autoscroll_next.tv_sec++;
+					autoscroll_next.tv_nsec -= 1000000000L;
+				}
+			}
+		}
+
 		/*
 		 * To reduce flicker and tearing, when new content or event
 		 * triggers drawing, we first wait a bit to ensure we got
@@ -2063,6 +2153,13 @@ run(void)
 		draw();
 		XFlush(xw.dpy);
 		drawing = 0;
+
+		/* schedule next autoscroll wakeup */
+		if (autoscroll_active) {
+			int ms = TIMEDIFF(autoscroll_next, now);
+			if (timeout < 0 || ms < timeout)
+				timeout = ms;
+		}
 	}
 }
 

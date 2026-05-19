@@ -568,8 +568,11 @@ renderline(int y)
 {
 	int start, v;
 
-	if (sb.view_offset <= 0)
+	if (sb.view_offset <= 0) {
+		if (y < 0 || y >= term.row)
+			return emptyline();
 		return term.line[y];
+	}
 
 	start = sb.len - sb.view_offset; /* can be negative */
 	v = start + y;
